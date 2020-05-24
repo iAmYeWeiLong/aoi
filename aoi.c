@@ -27,9 +27,9 @@ struct object {
 };
 
 struct object_set {
-	int cap;
-	int number;
-	struct object ** slot;
+	int cap; // 容量
+	int number; // 实际数量
+	struct object ** slot; // 连续的实体对象指针
 };
 
 struct pair_list {
@@ -40,27 +40,29 @@ struct pair_list {
 	int marker_version;
 };
 
+// 其中一个 hash 槽
 struct map_slot {
-	uint32_t id;
-	struct object * obj;
-	int next;
+	uint32_t id; // 实体对象 id
+	struct object * obj; // 指向的实体对象
+	int next; // 下一个实体所在索引。发生 hash 冲突时这个值才有意义，否则都是 -1
 };
 
+// 哈希表，存放实体对象相关信息
 struct map {
-	int size;
-	int lastfree;
-	struct map_slot * slot;
+	int size; // 下面那堆 slot 的个数
+	int lastfree; // 最后一个空闲未用 slot 的索引
+	struct map_slot * slot; // 一堆连续的哈希 slot，一个 slot 存一个 实体对象信息
 };
 
 struct aoi_space {
 	aoi_Alloc alloc;
 	void * alloc_ud;
-	struct map * object;
+	struct map * object; // 哈希表，存放实体对象相关；变量名字起得和另一个结构体名竟然相同！！
 	struct object_set * watcher_static;
 	struct object_set * marker_static;
 	struct object_set * watcher_move;
 	struct object_set * marker_move;
-	struct pair_list * hot;
+	struct pair_list * hot; // 热点对
 };
 
 static struct object *
@@ -73,9 +75,10 @@ new_object(struct aoi_space * space, uint32_t id) {
 	return obj;
 }
 
+// 根据实体对象的 id 找到相应的 slot;用的算是 hash 算法了
 static inline struct map_slot *
 mainposition(struct map *m , uint32_t id) {
-	uint32_t hash = id & (m->size-1);
+	uint32_t hash = id & (m->size-1); // 高科技啊! size-1 值的二进制刚好是低位全是 1
 	return &m->slot[hash];
 }
 
@@ -84,38 +87,57 @@ static void rehash(struct aoi_space * space, struct map *m);
 static void
 map_insert(struct aoi_space * space , struct map * m, uint32_t id , struct object *obj) {
 	struct map_slot *s = mainposition(m,id);
-	if (s->id == INVALID_ID) {
+	if (s->id == INVALID_ID) { // 刚好是空闲的
 		s->id = id;
 		s->obj = obj;
 		return;
 	}
+	// 重复插入 ？？？
+
+	// 发现了占座位现象，旧对象得让座 （不能  s->id != id 这样比来检查非法占座位，不同的 id 想占同一个座位说明是发生哈希冲突，是合理现象）
+	// 
 	if (mainposition(m, s->id) != s) {
-		struct map_slot * last = mainposition(m,s->id);
+		struct map_slot * last = mainposition(m,s->id); // 原本应该所在座位，就是头节点
+
+		// 找出谁指向这个座位
 		while (last->next != s - m->slot) {
 			assert(last->next >= 0);
 			last = &m->slot[last->next];
 		}
+		// 暂存旧对象
 		uint32_t temp_id = s->id;
 		struct object * temp_obj = s->obj;
+
+		// 链回去， s 出链
 		last->next = s->next;
+
+		// 新对象入座位
 		s->id = id;
 		s->obj = obj;
 		s->next = -1;
+
+		// 旧对象重新找个座位
 		if (temp_obj) {
 			map_insert(space, m, temp_id, temp_obj);
 		}
 		return;
 	}
+	// 处理哈希冲突（多个人想坐一个座位），找个空闲的 slot 占座（从后往前找）
+	// 这里乱占座位的行为，会导致占了本应该是别人的座位，只是主人还没有入座，后面要是主人来了还得让座
 	while (m->lastfree >= 0) {
 		struct map_slot * temp = &m->slot[m->lastfree--];
 		if (temp->id == INVALID_ID) {
 			temp->id = id;
 			temp->obj = obj;
+
+			// 插在前面的第 2 位（逻辑意义上的 “前”，插在第 2 位纯属好实现而已）
 			temp->next = s->next;
 			s->next = (int)(temp - m->slot);
 			return;
 		}
 	}
+
+	// 空闲的 slot 不足了，重新哈希后再插入
 	rehash(space,m);
 	map_insert(space, m, id , obj);
 }
@@ -128,21 +150,26 @@ rehash(struct aoi_space * space, struct map *m) {
 	m->lastfree = m->size - 1;
 	m->slot = space->alloc(space->alloc_ud, NULL, m->size * sizeof(struct map_slot));
 	int i;
+
+	// 对一堆新的 slot 进行初始化
 	for (i=0;i<m->size;i++) {
 		struct map_slot * s = &m->slot[i];
 		s->id = INVALID_ID;
 		s->obj = NULL;
 		s->next = -1;
 	}
+	// 把旧的 实体对象 插入到新的一堆 slot 中
 	for (i=0;i<old_size;i++) {
 		struct map_slot * s = &old_slot[i];
 		if (s->obj) {
 			map_insert(space, m, s->id, s->obj);
 		}
 	}
+	// free 旧内存
 	space->alloc(space->alloc_ud, old_slot, old_size * sizeof(struct map_slot));
 }
 
+// 查不到会进行插入！！！
 static struct object *
 map_query(struct aoi_space *space, struct map * m, uint32_t id) {
 	struct map_slot *s = mainposition(m, id);
@@ -153,6 +180,9 @@ map_query(struct aoi_space *space, struct map * m, uint32_t id) {
 			}
 			return s->obj;
 		}
+		// 走到这里，都是发生了哈希冲突的
+
+		// 向后找（逻辑意义上的后）
 		if (s->next < 0) {
 			break;
 		}
@@ -424,8 +454,10 @@ set_push_back(struct aoi_space * space, struct object_set * set, struct object *
 	if (set->number >= set->cap) {
 		int cap = set->cap * 2;
 		void * tmp =  set->slot;
+		// allocate
 		set->slot = space->alloc(space->alloc_ud, NULL, cap * sizeof(struct object *));
 		memcpy(set->slot, tmp ,  set->cap * sizeof(struct object *));
+		// free
 		space->alloc(space->alloc_ud, tmp, set->cap * sizeof(struct object *));
 		set->cap = cap;
 	}
