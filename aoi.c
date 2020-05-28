@@ -10,7 +10,9 @@
 
 #define INVALID_ID (~0)
 #define PRE_ALLOC 16
+// 比较时用这个 2 次方的值，因为下面的计算出来的距离也没有开根号
 #define AOI_RADIS2 (AOI_RADIS * AOI_RADIS)
+// 三维空间的 2 点间距离公式。但不开根号，避免性能损失。
 #define DIST2(p1,p2) ((p1[0] - p2[0]) * (p1[0] - p2[0]) + (p1[1] - p2[1]) * (p1[1] - p2[1]) + (p1[2] - p2[2]) * (p1[2] - p2[2]))
 #define MODE_WATCHER 1
 #define MODE_MARKER 2
@@ -210,6 +212,7 @@ map_drop(struct map *m, uint32_t id) {
 	for (;;) {
 		if (s->id == id) {
 			struct object * obj = s->obj;
+			// 置空即可，并不是真删
 			s->obj = NULL;
 			return obj;
 		}
@@ -242,6 +245,7 @@ map_new(struct aoi_space *space) {
 	return m;
 }
 
+// 增加引用计数
 inline static void
 grab_object(struct object *obj) {
 	++obj->ref;
@@ -332,6 +336,7 @@ change_mode(struct object * obj, bool set_watcher, bool set_marker) {
 		if (set_marker) {
 			obj->mode |= MODE_MARKER;
 		}
+		// set_watcher 和 set_marker 肯定至少一个为真的
 		return true;
 	}
 	if (set_watcher) {
@@ -359,6 +364,7 @@ change_mode(struct object * obj, bool set_watcher, bool set_marker) {
 	return change;
 }
 
+// 两点间的距离是否小于 AOI 半径的一半
 inline static bool
 is_near(float p1[3], float p2[3]) {
 	return DIST2(p1,p2) < AOI_RADIS2 * 0.25f ;
@@ -397,16 +403,21 @@ aoi_update(struct aoi_space * space , uint32_t id, const char * modestring , flo
 
 	if (obj->mode & MODE_DROP) {
 		obj->mode &= ~MODE_DROP;
+		// 要 drop 了，反而还在增加引用计数，如何理解？？？？
 		grab_object(obj);
 	}
 
 	bool changed = change_mode(obj, set_watcher, set_marker);
 
 	copy_position(obj->position, pos);
+	
+	// 与上一版本的座标比，走远了就要走两两比较的逻辑，不能再走热点对比较的逻辑
+	// 不然 n 次小步阀移动之后可能两个对象互见了却因为彼此不是热点对，丟了 AOI 事件。
 	if (changed || !is_near(pos, obj->last)) {
 		// new object or change object mode
 		// or position changed
-		copy_position(obj->last , pos);
+		// 少数高速运动或跳转的对象会被打上 move 标记
+		copy_position(obj->last , pos); // 关键点坐标
 		obj->mode |= MODE_MOVE;
 		++obj->version;
 	} 
@@ -419,6 +430,7 @@ drop_pair(struct aoi_space * space, struct pair_list *p) {
 	space->alloc(space->alloc_ud, p, sizeof(*p));
 }
 
+// 产生热点对的 aoi 消息
 static void
 flush_pair(struct aoi_space * space, aoi_Callback cb, void *ud) {
 	struct pair_list **last = &(space->hot);
@@ -430,18 +442,29 @@ flush_pair(struct aoi_space * space, aoi_Callback cb, void *ud) {
 			(p->watcher->mode & MODE_DROP) ||
 			(p->marker->mode & MODE_DROP)
 			) {
+
+			// blog: 只要有一个对象对象发生了改变，就将这个热点对抛弃。（因为一定有新的正确关联这两个对象的热点对在这个列表中）
+			// 说人话就是： 如果实体对象的 version 变了，说明 obj->mode 也被设了 MODE_MOVE。后面会走 两两比较的逻辑。
 			drop_pair(space, p);
 			*last = next;
+
+		// 没有位移或是移动距离小于 AOI 半径的一半
 		} else {
+			// 要结合这个 热点对是如何产生的来理解； 能进热点对说明上一个 tick 有大步长位移，当前 tick 却是小步长位移
 			float distance2 = dist2(p->watcher , p->marker);
+			// 两点间距离大于 AOI 半径 * 2
 			if (distance2 > AOI_RADIS2 * 4) {
 				drop_pair(space,p);
 				*last = next;
+			// 互相可见了
 			} else if (distance2 < AOI_RADIS2) {
+				// blog:当距离小于 AOI 半径时，发送 AOI 消息，并把自己从列表中删除
 				cb(ud, p->watcher->id, p->marker->id);
+
 				drop_pair(space,p);
 				*last = next;
-			} else {
+			} else { // 大于 AOI 的
+				// blog:保留在列表中等待下个 tick 处理 
 				last = &(p->next);
 			}
 		}
@@ -465,10 +488,12 @@ set_push_back(struct aoi_space * space, struct object_set * set, struct object *
 	++set->number;
 }
 
+// 根据状态位把 实体对象 加到相应的链表，并把 MODE_MOVE 标志去掉
 static void
 set_push(void * s, struct object * obj) {
 	struct aoi_space * space = s;
 	int mode = obj->mode;
+	// 一个实体对象最少进 1 个链表，最多进 2 个链表
 	if (mode & MODE_WATCHER) {
 		if (mode & MODE_MOVE) {
 			set_push_back(space, space->watcher_move , obj);
@@ -487,19 +512,23 @@ set_push(void * s, struct object * obj) {
 	}
 }
 
+// 产生 aoi 消息或加入到热点对
 static void
 gen_pair(struct aoi_space * space, struct object * watcher, struct object * marker, aoi_Callback cb, void *ud) {
 	if (watcher == marker) {
 		return;
 	}
 	float distance2 = dist2(watcher, marker);
+	// AOI 重叠了。即是视野范围内
 	if (distance2 < AOI_RADIS2) {
 		cb(ud, watcher->id, marker->id);
 		return;
 	}
+	// 若距离比较远（ 两点间距离大于 AOI*2），他们将不会进入热点对
 	if (distance2 > AOI_RADIS2 * 4) {
 		return;
 	}
+	// 对于 AOI 半径 <= 距离 <= AOI 半径 * 2 的生成新的热点对
 	struct pair_list * p = space->alloc(space->alloc_ud, NULL, sizeof(*p));
 	p->watcher = watcher;
 	grab_object(watcher);
@@ -511,6 +540,7 @@ gen_pair(struct aoi_space * space, struct object * watcher, struct object * mark
 	space->hot = p;
 }
 
+// 产生消息，在过程中顺便生成热点对
 static void
 gen_pair_list(struct aoi_space *space, struct object_set * watcher, struct object_set * marker, aoi_Callback cb, void *ud) {
 	int i,j;
@@ -524,11 +554,17 @@ gen_pair_list(struct aoi_space *space, struct object_set * watcher, struct objec
 void 
 aoi_message(struct aoi_space *space, aoi_Callback cb, void *ud) {
 	flush_pair(space,  cb, ud);
+	// 各个 number 置 0，则相当于删除 4 个链表的全部元素（没有真删，要用时覆盖上去） 
 	space->watcher_static->number = 0;
 	space->watcher_move->number = 0;
 	space->marker_static->number = 0;
 	space->marker_move->number = 0;
+	
+	// 遍历全部实体对象一次，根据状态，重新生成 4 个链表
+	// 一个实体对象最少进 1 个链表，最多进 2 个链表
 	map_foreach(space->object, set_push , space);	
+
+	// 两两比较 （至少有一个 move 参与比较）（两个 static 不互相比）
 	gen_pair_list(space, space->watcher_static, space->marker_move, cb, ud);
 	gen_pair_list(space, space->watcher_move, space->marker_static, cb, ud);
 	gen_pair_list(space, space->watcher_move, space->marker_move, cb, ud);
