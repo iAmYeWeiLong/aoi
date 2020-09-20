@@ -25,7 +25,7 @@ struct object {
 	int version;
 	int mode;
 	float last[3];
-	float position[3];
+	float position[3]; // 存放最新的座标
 };
 
 struct object_set {
